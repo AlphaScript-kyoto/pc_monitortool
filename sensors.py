@@ -73,6 +73,21 @@ def cpu_name() -> str:
         return "CPU"
 
 
+def cpu_temperature_available() -> bool:
+    """起動時に一度だけ、Windows が CPU 温度を出しているか確認します。"""
+    try:
+        readings = psutil.sensors_temperatures()
+    except Exception:
+        return False
+    if not readings:
+        return False
+    for entries in readings.values():
+        for entry in entries:
+            if entry.current is not None and entry.current > 0:
+                return True
+    return False
+
+
 def read_cpu_temperature() -> float | None:
     """Windows が公開している温度があれば使います。
 
@@ -256,6 +271,7 @@ class SystemSensors:
         self.cpu_name = cpu_name()
         self.gpu = AmdGpu()
         self.last_error = self.gpu.last_error
+        self._cpu_temp_available = cpu_temperature_available()
         psutil.cpu_percent(interval=None)
 
     def read(self) -> Sample:
@@ -273,7 +289,7 @@ class SystemSensors:
             cpu_name=self.cpu_name,
             gpu_name=self.gpu.name,
             cpu_util=round(cpu_util, 1),
-            cpu_temp=read_cpu_temperature(),
+            cpu_temp=read_cpu_temperature() if self._cpu_temp_available else None,
             memory_used_mb=round(used_bytes / (1024 * 1024), 1),
             memory_total_mb=round(memory.total / (1024 * 1024), 1),
             memory_percent=round(memory.percent, 1),

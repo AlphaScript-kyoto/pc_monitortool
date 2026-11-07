@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -22,18 +23,30 @@ FIELDS = [
 ]
 
 
+def _open_new_log(folder: Path, extension: str, encoding: str):
+    """同じ秒に記録を始めても、前のファイルを消さないようにします。"""
+    for _ in range(5):
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
+        token = uuid.uuid4().hex[:8]
+        path = folder / f"playlog_{stamp}_{token}.{extension}"
+        try:
+            handle = path.open("x", encoding=encoding, newline="\n")
+        except FileExistsError:
+            continue
+        return path, handle
+    raise FileExistsError("記録ファイルを新しく作れませんでした。")
+
+
 class SessionRecorder:
     def __init__(self, folder: Path, kind: str) -> None:
         if kind not in {"csv", "json"}:
             raise ValueError(f"未対応の形式です: {kind}")
         folder.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         extension = "csv" if kind == "csv" else "jsonl"
-        self.path = folder / f"playlog_{stamp}.{extension}"
         self.kind = kind
         self.count = 0
         encoding = "utf-8-sig" if kind == "csv" else "utf-8"
-        self._file = self.path.open("w", encoding=encoding, newline="\n")
+        self.path, self._file = _open_new_log(folder, extension, encoding)
         self._writer: csv.DictWriter | None = None
         if kind == "csv":
             self._writer = csv.DictWriter(self._file, fieldnames=FIELDS)

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import hashlib
 import shutil
 import subprocess
 import threading
 import time
 import urllib.request
 from collections import deque
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +24,8 @@ PRESENTMON_URL = (
     "https://github.com/GameTechDev/PresentMon/releases/download/v2.4.1/"
     + PRESENTMON_NAME
 )
+# Intel の署名が付いた PresentMon 2.4.1 x64 の SHA-256 です。
+PRESENTMON_SHA256 = "d74183e7ae630f72cd3690be0373ecbfdc6cbb86578148aab8fa2a7166068f34"
 
 # ゲームそのものではない、よく画面に出るソフトです。
 IGNORED_PROCESSES = {
@@ -64,7 +68,7 @@ def presentmon_path(root: Path) -> Path:
 
 
 def ensure_presentmon(path: Path) -> Path:
-    if _looks_like_exe(path):
+    if _trusted_presentmon(path):
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".part")
@@ -74,9 +78,9 @@ def ensure_presentmon(path: Path) -> Path:
     )
     with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as handle:
         shutil.copyfileobj(response, handle)
-    if not _looks_like_exe(temporary):
+    if not _trusted_presentmon(temporary):
         temporary.unlink(missing_ok=True)
-        raise RuntimeError("FPS 計測用の PresentMon をダウンロードできませんでした。")
+        raise RuntimeError("FPS 計測用の PresentMon を確認できませんでした。")
     temporary.replace(path)
     return path
 
@@ -152,20 +156,92 @@ def _release_trace_session() -> None:
     )
 
 
-def _looks_like_exe(path: Path) -> bool:
-    if not path.exists() or path.stat().st_size < 500_000:
-        return False
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        return handle.read(2) == b"MZ"
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _trusted_presentmon(path: Path) -> bool:
+    """公式の SHA-256 と、Intel のデジタル署名が両方そろっているときだけ使います。"""
+    if not path.is_file():
+        return False
+    try:
+        if _sha256(path) != PRESENTMON_SHA256:
+            return False
+    except OSError:
+        return False
+    return _authenticode_valid(path)
+
+
+def _authenticode_valid(path: Path) -> bool:
+    class Guid(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_ulong),
+            ("Data2", ctypes.c_ushort),
+            ("Data3", ctypes.c_ushort),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class TrustFile(ctypes.Structure):
+        _fields_ = [
+            ("cbStruct", ctypes.c_ulong),
+            ("pcwszFilePath", ctypes.c_wchar_p),
+            ("hFile", ctypes.c_void_p),
+            ("pgKnownSubject", ctypes.c_void_p),
+        ]
+
+    class TrustData(ctypes.Structure):
+        _fields_ = [
+            ("cbStruct", ctypes.c_ulong),
+            ("pPolicyCallbackData", ctypes.c_void_p),
+            ("pSIPClientData", ctypes.c_void_p),
+            ("dwUIChoice", ctypes.c_ulong),
+            ("fdwRevocationChecks", ctypes.c_ulong),
+            ("dwUnionChoice", ctypes.c_ulong),
+            ("pFile", ctypes.c_void_p),
+            ("dwStateAction", ctypes.c_ulong),
+            ("hWVTStateData", ctypes.c_void_p),
+            ("pwszURLReference", ctypes.c_wchar_p),
+            ("dwProvFlags", ctypes.c_ulong),
+            ("dwUIContext", ctypes.c_ulong),
+            ("pSignatureSettings", ctypes.c_void_p),
+        ]
+
+    guid = Guid(
+        0x00AAC56B,
+        0xCD44,
+        0x11D0,
+        (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE),
+    )
+    info = TrustFile(ctypes.sizeof(TrustFile), str(path.resolve()), None, None)
+    data = TrustData()
+    data.cbStruct = ctypes.sizeof(TrustData)
+    data.dwUIChoice = 2
+    data.fdwRevocationChecks = 0
+    data.dwUnionChoice = 1
+    data.pFile = ctypes.cast(ctypes.pointer(info), ctypes.c_void_p)
+    data.dwStateAction = 1
+    data.dwProvFlags = 0x10
+    verify = ctypes.WinDLL("wintrust").WinVerifyTrust
+    verify.argtypes = [wintypes.HWND, ctypes.POINTER(Guid), ctypes.POINTER(TrustData)]
+    verify.restype = ctypes.c_long
+    result = verify(None, ctypes.byref(guid), ctypes.byref(data))
+    data.dwStateAction = 2
+    verify(None, ctypes.byref(guid), ctypes.byref(data))
+    return result == 0
 
 
 @dataclass(frozen=True)
 class FpsReading:
-    """displayed は画面に出たFPS、base はフレーム生成前のFPSです。"""
+    """displayed は画面に出たFPS、rendered は描画したFPS、base はフレーム生成前のFPSです。"""
 
     displayed: float
     base: float | None = None
     frame_gen: bool = False
+    rendered: float | None = None
 
     def label(self) -> str:
         if self.frame_gen and self.base is not None:
@@ -176,7 +252,8 @@ class FpsReading:
 @dataclass
 class _Frame:
     arrived: float
-    display_ms: float
+    present_ms: float | None
+    display_ms: float | None
     app_ms: float | None
     generated: bool
 
@@ -228,15 +305,21 @@ def _generation_ratio(displayed: float, base: float) -> bool:
 
 
 def summarize_frames(frames: list[_Frame]) -> FpsReading | None:
-    if len(frames) < 2:
+    displayed_frames = [frame for frame in frames if frame.display_ms is not None]
+    if len(displayed_frames) < 2:
         return None
-    displayed = _mean_fps([frame.display_ms for frame in frames])
-    app_intervals = [frame.app_ms for frame in frames if frame.app_ms is not None and not frame.generated]
+    displayed = _mean_fps([frame.display_ms for frame in displayed_frames if frame.display_ms is not None])
+    rendered = _mean_fps([frame.present_ms for frame in frames if frame.present_ms is not None])
+    app_intervals = [
+        frame.app_ms
+        for frame in displayed_frames
+        if frame.app_ms is not None and not frame.generated
+    ]
     base = _mean_fps([value for value in app_intervals if value is not None])
     if displayed is None:
         return None
-    generated_count = sum(1 for frame in frames if frame.generated)
-    generated_ratio = generated_count / len(frames)
+    generated_count = sum(1 for frame in displayed_frames if frame.generated)
+    generated_ratio = generated_count / len(displayed_frames)
     if base is None and generated_ratio >= 0.2:
         base = displayed * (1.0 - generated_ratio)
     frame_gen = False
@@ -248,7 +331,8 @@ def summarize_frames(frames: list[_Frame]) -> FpsReading | None:
         base = None
     shown = round(displayed, 1)
     native = None if base is None else round(base, 1)
-    return FpsReading(displayed=shown, base=native, frame_gen=frame_gen)
+    drawn = None if rendered is None else round(rendered, 1)
+    return FpsReading(displayed=shown, base=native, frame_gen=frame_gen, rendered=drawn)
 
 
 class FpsTracker:
@@ -258,6 +342,7 @@ class FpsTracker:
         self.needs_admin = False
         self.ready = False
         self._running = False
+        self._closed = False
         self._live_csv: Path | None = None
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
@@ -275,18 +360,22 @@ class FpsTracker:
         try:
             self.status = "FPS計測の準備をしています"
             ensure_presentmon(exe)
+            if self._closed:
+                return
             self.start(exe)
         except Exception as error:
             self.status = "FPSを開始できませんでした"
             self.message = str(error)
 
     def start(self, exe: Path) -> None:
-        if self._running:
+        if self._closed or self._running:
             return
         self._restarts = 0
         self._launch(exe)
 
     def _launch(self, exe: Path) -> None:
+        if self._closed:
+            return
         if not exe.exists():
             raise FileNotFoundError(f"PresentMon が見つかりません: {exe}")
         self._exe = exe
@@ -303,6 +392,8 @@ class FpsTracker:
             "--no_console_stats",
             "--no_track_input",
             "--no_track_gpu",
+            "--track_frame_type",
+            "--track_app_timing",
             "--set_circular_buffer_size",
             "8192",
             "--session_name",
@@ -312,12 +403,20 @@ class FpsTracker:
             "dwm.exe",
         ]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if self._closed:
+            self._running = False
+            return
         self._proc = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=creationflags,
         )
+        if self._closed:
+            self._shutdown_child()
+            self._running = False
+            self.ready = False
+            return
         _tie_child_to_parent(self._proc)
         self._thread = threading.Thread(target=self._read_output, name="fps-read", daemon=True)
         self._thread.start()
@@ -331,7 +430,7 @@ class FpsTracker:
 
     def _watch_ready(self, generation: int) -> None:
         time.sleep(5)
-        if generation != self._generation or not self._running or self.ready:
+        if self._closed or generation != self._generation or not self._running or self.ready:
             return
         if self._restarts >= 1:
             self.status = "FPS計測を起動しています"
@@ -357,6 +456,7 @@ class FpsTracker:
         self._thread = None
 
     def stop(self) -> None:
+        self._closed = True
         self._running = False
         self._generation += 1
         self._shutdown_child()
@@ -467,12 +567,13 @@ class FpsTracker:
             except ValueError:
                 continue
             present_ms = _optional_ms(columns, present_index)
-            display_ms = _optional_ms(columns, display_index) or present_ms
-            if display_ms is None:
+            display_ms = _optional_ms(columns, display_index)
+            if present_ms is None and display_ms is None:
                 continue
             frame_type = columns[type_index].strip() if type_index is not None and type_index < len(columns) else ""
             sample = _Frame(
                 arrived=time.monotonic(),
+                present_ms=present_ms,
                 display_ms=display_ms,
                 app_ms=_optional_ms(columns, app_ms_index),
                 generated=_is_generated_frame(frame_type),

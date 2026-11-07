@@ -71,9 +71,7 @@ def relaunch_as_admin() -> bool:
 
     params = subprocess.list2cmdline([script, *sys.argv[1:]])
     result = shell.ShellExecuteW(None, "runas", sys.executable, params, str(ROOT), 1)
-    if result and result > 32:
-        os._exit(0)
-    return False
+    return bool(result and result > 32)
 
 
 def foreground_exe() -> str | None:
@@ -413,8 +411,13 @@ class MonitorApp:
         self.recorder = None
         if recorder is not None:
             count = recorder.count
-            recorder.close()
-            self.path_var.set(f"保存しました（{count}件）: {recorder.path}")
+            try:
+                recorder.close()
+            except OSError as error:
+                remember_error(str(error))
+                self.path_var.set(f"記録ファイルを閉じられませんでした: {error}")
+            else:
+                self.path_var.set(f"保存しました（{count}件）: {recorder.path}")
         self.record_button.configure(text="記録を開始", bg=ACCENT, activebackground="#9ab6ff")
         self.root.title("PCモニターツール")
         self.state_label.configure(text="待機中", fg=MUTED)
@@ -558,17 +561,27 @@ class MonitorApp:
     def become_admin(self) -> None:
         if not relaunch_as_admin():
             self.path_var.set("管理者としての起動はキャンセルされました。このまま使えます。")
+            return
+        self.close()
 
     def close(self) -> None:
         if self._closing:
             return
         self._closing = True
-        if self.recording:
-            self.stop_recording(beep=False)
-        self.hotkeys.close()
-        self.fps.stop()
-        self.sensors.close()
-        self.root.destroy()
+        try:
+            if self.recording:
+                self.stop_recording(beep=False)
+        finally:
+            try:
+                self.hotkeys.close()
+            finally:
+                try:
+                    self.fps.stop()
+                finally:
+                    try:
+                        self.sensors.close()
+                    finally:
+                        self.root.destroy()
 
     def run(self) -> None:
         self.root.mainloop()
